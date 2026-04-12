@@ -1,0 +1,24 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 大容量データ（Git管理対象外）
+stock_data/
+stock_data_*.csv
+meta_data.xls
+*.xls
+*.xlsx
+
+# バックテスト結果（再現可能なので除外）
+backtest/results/
+backtest/__pycache__/
+
+# macOS
+.DS_Store
+
+# その他
+.claude/
+financial_data/
+data_backup/
