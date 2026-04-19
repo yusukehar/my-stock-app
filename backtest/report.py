@@ -277,6 +277,103 @@ def save_daily_csv(daily_records: list, output_dir: str):
     print(f"  日次記録  → {path}")
 
 
+def save_open_positions_csv(
+    positions: dict,
+    closes: 'pd.DataFrame',
+    end_date: str,
+    output_dir: str,
+    meta_path: str = None,
+):
+    """
+    バックテスト終了時点で保有中の銘柄一覧を CSV で保存する。
+
+    出力列
+    ------
+    銘柄コード, 銘柄名（任意）, 業種（任意）,
+    初回エントリー日, 保有ロット数, 平均取得単価（円）,
+    期末株価（円）, 保有額（円）, 含み損益（円）, 含み損益率（%）
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if not positions:
+        print("  保有ポジションなし（open_positions CSV スキップ）")
+        return
+
+    end_ts = pd.Timestamp(end_date)
+
+    # end_date 以前で最も新しいデータ行を取得
+    avail_dates = closes.index[closes.index <= end_ts]
+    if avail_dates.empty:
+        print("  期末株価データなし（open_positions CSV スキップ）")
+        return
+    last_date = avail_dates[-1]
+
+    rows = []
+    for symbol, pos in positions.items():
+        # 期末株価
+        if symbol not in closes.columns:
+            last_price = float('nan')
+        else:
+            raw = closes[symbol].loc[last_date]
+            last_price = float(raw) if not pd.isna(raw) and raw > 0 else float('nan')
+
+        # ロット集計
+        total_invested = pos.total_invested
+        total_shares   = sum(lot.shares for lot in pos.lots)
+        avg_cost       = total_invested / total_shares if total_shares > 0 else float('nan')
+
+        if pd.isna(last_price):
+            market_value  = float('nan')
+            unrealized    = float('nan')
+            unrealized_pct = float('nan')
+        else:
+            market_value   = round(total_shares * last_price, 0)
+            unrealized     = round(total_shares * (last_price - avg_cost), 0)
+            unrealized_pct = round((last_price - avg_cost) / avg_cost * 100, 2) if avg_cost > 0 else float('nan')
+
+        rows.append({
+            '銘柄コード'        : symbol,
+            '初回エントリー日'   : pos.initial_entry_date,
+            '保有ロット数'       : len(pos.lots),
+            '平均取得単価（円）' : round(avg_cost, 2) if not pd.isna(avg_cost) else None,
+            '期末株価（円）'     : round(last_price, 2) if not pd.isna(last_price) else None,
+            '保有額（円）'       : market_value,
+            '含み損益（円）'     : unrealized,
+            '含み損益率（%）'    : unrealized_pct,
+        })
+
+    df = pd.DataFrame(rows).sort_values('初回エントリー日').reset_index(drop=True)
+
+    # 銘柄名・業種を付加（meta_path が指定された場合）
+    if meta_path and os.path.exists(meta_path):
+        try:
+            import sys
+            venv_sp = os.path.join(os.path.dirname(meta_path), 'venv',
+                                   'lib', 'python3.9', 'site-packages')
+            if os.path.isdir(venv_sp):
+                sys.path.insert(0, venv_sp)
+            import xlrd
+            wb  = xlrd.open_workbook(meta_path)
+            ws  = wb.sheets()[0]
+            hdr = [ws.cell_value(0, c) for c in range(ws.ncols)]
+            ci, ni, ii = hdr.index('コード'), hdr.index('銘柄名'), hdr.index('33業種区分')
+            name_map = {}
+            for r in range(1, ws.nrows):
+                cv   = ws.cell_value(r, ci)
+                code = str(int(cv)) if isinstance(cv, float) and cv > 0 else str(cv).strip()
+                if code not in name_map:
+                    name_map[code] = (ws.cell_value(r, ni), ws.cell_value(r, ii))
+            df['_code'] = df['銘柄コード'].str.replace('.T', '', regex=False)
+            df.insert(1, '銘柄名', df['_code'].map(lambda c: name_map.get(c, ('', ''))[0]))
+            df.insert(2, '業種',   df['_code'].map(lambda c: name_map.get(c, ('', ''))[1]))
+            df.drop(columns=['_code'], inplace=True)
+        except Exception as e:
+            print(f"  ※ 銘柄名の付加に失敗しました: {e}")
+
+    path = os.path.join(output_dir, 'open_positions.csv')
+    df.to_csv(path, index=False, encoding='utf-8-sig')
+    print(f"  保有銘柄  → {path}  ({len(df)} 銘柄)")
+
+
 def plot_equity_curve(
     daily_records: list,
     output_dir: str,

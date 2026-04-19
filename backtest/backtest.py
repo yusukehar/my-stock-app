@@ -12,7 +12,7 @@ from engine import run_backtest
 from report import (
     compute_summary, compute_max_drawdown,
     print_summary, save_trades_csv, save_daily_csv, plot_equity_curve,
-    save_transactions_csv,
+    save_transactions_csv, save_open_positions_csv,
 )
 
 
@@ -45,11 +45,21 @@ PARAMS = {
 
     # --- ポジション管理 ---
     'lot_amount'           :  70_000,    # 1 ロットあたりの投資金額（円）
-    'max_amount_per_stock' : 500_000,    # 1 銘柄あたりの最大保有金額（円）
+    'max_amount_per_stock' : 800_000,    # 1 銘柄あたりの最大保有金額（円）
     'max_positions'        :    15,    # 同時保有できる最大銘柄数（None = 制限なし）
 
     # --- 予算管理 ---
     'total_budget'         : 4_000_000,  # 総予算（円）。利確・損切りの回収金額は全額返還
+
+    # --- スワップロジック ---
+    'swap_enabled'     : True,   # スワップロジックを使用するか
+    'swap_i'           : 3,      # スワップ候補の連続上昇回数（通常エントリーより1回多く）
+    'swap_top_pct'     : 0.05,   # 上位何%をスワップ候補とするか（5%）
+    'swap_ratio'       : 1.5,    # 新規スコアが最弱ポジの何倍以上でスワップ実行
+    'protect_gain_pct' : 20.0,   # 含み益がこの%以上のポジションはスワップ売り対象外
+    'score_update_days': 5,      # スコアキャッシュを更新する間隔（営業日）
+    'lookback_return'  : 20,     # 株価騰落率の参照期間（営業日）
+    'lookback_candles' : 10,     # 陽線比率の参照期間（営業日）
 }
 
 # ============================================================
@@ -92,30 +102,36 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
 
 def load_data(path: str):
     """
-    yfinance 形式（MultiIndex 列）の CSV を読み込み、全銘柄の closes と volume を返す。
+    yfinance 形式（MultiIndex 列）の CSV を読み込み、全銘柄の closes・opens・volume を返す。
     universe の絞り込みはしない（build_daily_universe で行う）。
 
     Returns
     -------
     closes : 終値 DataFrame（行=日付, 列=銘柄コード）
+    opens  : 始値 DataFrame（同形式）。データがない場合は None。
     volume : 出来高 DataFrame（同形式）。データがない場合は None。
     """
     print(f"データ読み込み中: {path}")
     df = pd.read_csv(path, header=[0, 1], index_col=0, parse_dates=True)
 
     if isinstance(df.columns, pd.MultiIndex):
+        level0 = df.columns.get_level_values(0)
         closes = df['Close']
-        volume = df['Volume'] if 'Volume' in df.columns.get_level_values(0) else None
+        opens  = df['Open']   if 'Open'   in level0 else None
+        volume = df['Volume'] if 'Volume' in level0 else None
     else:
         closes = df
+        opens  = None
         volume = None
 
     closes = closes.sort_index().dropna(axis=1, how='all')
+    if opens is not None:
+        opens  = opens.reindex(columns=closes.columns).sort_index()
     if volume is not None:
         volume = volume.reindex(columns=closes.columns).sort_index()
 
     print(f"  → {len(closes)} 日分 × {len(closes.columns)} 銘柄を読み込みました")
-    return closes, volume
+    return closes, opens, volume
 
 
 def build_daily_universe(
@@ -267,7 +283,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     # --- データ読み込み（全銘柄・universe絞り込みなし）---
-    closes, volume = load_data(STOCK_DATA_PATH)
+    closes, opens, volume = load_data(STOCK_DATA_PATH)
 
     # --- 日次 universe 構築（ルックアヘッドバイアスなし）---
     print(f"\nuniverse構築中（lookback={UNIVERSE_LOOKBACK}日, size={UNIVERSE_SIZE}）...")
@@ -316,8 +332,11 @@ if __name__ == '__main__':
 
     # --- バックテスト実行 ---
     print(f"\nバックテスト期間: {START_DATE} 〜 {END_DATE}")
-    trades, daily_records, transactions = run_backtest(
-        closes, PARAMS, START_DATE, END_DATE, daily_universe=daily_universe
+    trades, daily_records, transactions, open_positions = run_backtest(
+        closes, PARAMS, START_DATE, END_DATE,
+        daily_universe=daily_universe,
+        opens=opens,
+        volume=volume,
     )
     print(f"完了: {len(trades)} 件の取引が発生しました\n")
 
@@ -353,19 +372,9 @@ if __name__ == '__main__':
     plot_equity_curve(daily_records, OUTPUT_DIR,
                       total_budget=PARAMS['total_budget'], index_df=index_df)
     # 銘柄名付き全売買記録
-    _meta = os.path.join(os.path.dirname(STOCK_DATA_PATH), '..', 'meta_data.xls')
-    save_transactions_csv(transactions, OUTPUT_DIR, meta_path=os.path.normpath(_meta))
+    _meta = os.path.normpath(os.path.join(os.path.dirname(STOCK_DATA_PATH), '..', 'meta_data.xls'))
+    save_transactions_csv(transactions, OUTPUT_DIR, meta_path=_meta)
+    # 保有中ポジション一覧
+    save_open_positions_csv(open_positions, closes, END_DATE, OUTPUT_DIR, meta_path=_meta)
     print(f"\n結果の出力先: {OUTPUT_DIR}\n")
 
-    # デバッグ: キオクシアの状況確認
-    kioxia = '285A.T'
-    if kioxia in closes.columns:
-        print(f"\n[DEBUG] {kioxia} first_seen: {closes[kioxia].dropna().index[0].date()}")
-        # 2025年2月以降でuniverseに入っているか確認
-        in_univ = [(d, kioxia in u) for d, u in daily_universe.items() if kioxia in u]
-        if in_univ:
-            print(f"[DEBUG] universe入り初日: {in_univ[0][0].date()}")
-        else:
-            print(f"[DEBUG] {kioxia} はuniverseに1度も入っていません")
-    else:
-        print(f"[DEBUG] {kioxia} はCSVに存在しません")
