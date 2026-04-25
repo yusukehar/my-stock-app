@@ -374,6 +374,132 @@ def save_open_positions_csv(
     print(f"  保有銘柄  → {path}  ({len(df)} 銘柄)")
 
 
+def save_per_stock_pnl_csv(
+    trades: list,
+    open_positions: dict,
+    closes: 'pd.DataFrame',
+    end_date: str,
+    output_dir: str,
+    meta_path: str = None,
+):
+    """
+    銘柄ごとの損益サマリーを CSV で保存する。
+
+    出力列
+    ------
+    銘柄コード, 銘柄名（任意）, 業種（任意）,
+    実現損益（円）, 実現取引ロット数,
+    含み損益（円）, 含み損益率（%）,  ← 保有中のみ。未保有は 0
+    合計損益（円）,
+    ステータス        ← '保有中' / '決済済み'
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── 実現損益の集計 ─────────────────────────────────────────────
+    realized_map: dict = {}   # symbol -> {'pnl': float, 'lots': int, 'invested': float}
+    if trades:
+        for t in trades:
+            sym = t['symbol']
+            if sym not in realized_map:
+                realized_map[sym] = {'pnl': 0.0, 'lots': 0, 'invested': 0.0}
+            realized_map[sym]['pnl']      += t['pnl']
+            realized_map[sym]['lots']     += 1
+            realized_map[sym]['invested'] += t['amount']
+
+    # ── 含み損益の集計 ─────────────────────────────────────────────
+    end_ts      = pd.Timestamp(end_date)
+    avail_dates = closes.index[closes.index <= end_ts]
+    last_date   = avail_dates[-1] if not avail_dates.empty else None
+
+    unrealized_map: dict = {}  # symbol -> {'unrealized_pnl': float, 'invested': float, 'last_price': float}
+    for sym, pos in open_positions.items():
+        total_shares   = sum(lot.shares for lot in pos.lots)
+        total_invested = pos.total_invested
+        avg_cost       = total_invested / total_shares if total_shares > 0 else 0.0
+
+        last_price = float('nan')
+        if last_date is not None and sym in closes.columns:
+            raw = closes[sym].loc[last_date]
+            if not pd.isna(raw) and raw > 0:
+                last_price = float(raw)
+
+        if not pd.isna(last_price):
+            unrealized = total_shares * (last_price - avg_cost)
+            unr_pct    = (last_price - avg_cost) / avg_cost * 100 if avg_cost > 0 else 0.0
+        else:
+            unrealized = float('nan')
+            unr_pct    = float('nan')
+
+        unrealized_map[sym] = {
+            'unrealized_pnl'     : unrealized,
+            'unrealized_pct'     : unr_pct,
+            'invested'           : total_invested,
+            'last_price'         : last_price,
+        }
+
+    # ── 全銘柄を統合 ──────────────────────────────────────────────
+    all_symbols = set(realized_map) | set(unrealized_map)
+    rows = []
+    for sym in sorted(all_symbols):
+        r = realized_map.get(sym, {'pnl': 0.0, 'lots': 0, 'invested': 0.0})
+        u = unrealized_map.get(sym)
+
+        realized_pnl  = r['pnl']
+        realized_lots = r['lots']
+        is_open       = u is not None
+
+        if is_open:
+            unr_pnl  = u['unrealized_pnl']
+            unr_pct  = u['unrealized_pct']
+        else:
+            unr_pnl  = 0.0
+            unr_pct  = None
+
+        total_pnl = realized_pnl + (unr_pnl if not pd.isna(unr_pnl) else 0.0)
+
+        rows.append({
+            '銘柄コード'        : sym,
+            '実現損益（円）'     : round(realized_pnl, 0),
+            '実現取引ロット数'   : realized_lots,
+            '含み損益（円）'     : round(unr_pnl, 0) if not pd.isna(unr_pnl) else None,
+            '含み損益率（%）'    : round(unr_pct, 2) if unr_pct is not None and not pd.isna(unr_pct) else None,
+            '合計損益（円）'     : round(total_pnl, 0),
+            'ステータス'         : '保有中' if is_open else '決済済み',
+        })
+
+    df = pd.DataFrame(rows).sort_values('合計損益（円）', ascending=False).reset_index(drop=True)
+
+    # ── 銘柄名・業種を付加 ────────────────────────────────────────
+    if meta_path and os.path.exists(meta_path):
+        try:
+            import sys
+            venv_sp = os.path.join(os.path.dirname(meta_path), 'venv',
+                                   'lib', 'python3.9', 'site-packages')
+            if os.path.isdir(venv_sp):
+                sys.path.insert(0, venv_sp)
+            import xlrd
+            wb  = xlrd.open_workbook(meta_path)
+            ws  = wb.sheets()[0]
+            hdr = [ws.cell_value(0, c) for c in range(ws.ncols)]
+            ci, ni, ii = hdr.index('コード'), hdr.index('銘柄名'), hdr.index('33業種区分')
+            name_map = {}
+            for r_i in range(1, ws.nrows):
+                cv   = ws.cell_value(r_i, ci)
+                code = str(int(cv)) if isinstance(cv, float) and cv > 0 else str(cv).strip()
+                if code not in name_map:
+                    name_map[code] = (ws.cell_value(r_i, ni), ws.cell_value(r_i, ii))
+            df['_code'] = df['銘柄コード'].str.replace('.T', '', regex=False)
+            df.insert(1, '銘柄名', df['_code'].map(lambda c: name_map.get(c, ('', ''))[0]))
+            df.insert(2, '業種',   df['_code'].map(lambda c: name_map.get(c, ('', ''))[1]))
+            df.drop(columns=['_code'], inplace=True)
+        except Exception as e:
+            print(f"  ※ 銘柄名の付加に失敗しました: {e}")
+
+    path = os.path.join(output_dir, 'per_stock_pnl.csv')
+    df.to_csv(path, index=False, encoding='utf-8-sig')
+    print(f"  銘柄別損益 → {path}  ({len(df)} 銘柄)")
+
+
 def plot_equity_curve(
     daily_records: list,
     output_dir: str,

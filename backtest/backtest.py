@@ -12,7 +12,7 @@ from engine import run_backtest
 from report import (
     compute_summary, compute_max_drawdown,
     print_summary, save_trades_csv, save_daily_csv, plot_equity_curve,
-    save_transactions_csv, save_open_positions_csv,
+    save_transactions_csv, save_open_positions_csv, save_per_stock_pnl_csv,
 )
 
 
@@ -376,5 +376,7 @@ if __name__ == '__main__':
     save_transactions_csv(transactions, OUTPUT_DIR, meta_path=_meta)
     # 保有中ポジション一覧
     save_open_positions_csv(open_positions, closes, END_DATE, OUTPUT_DIR, meta_path=_meta)
+    # 銘柄別損益サマリー（実現＋含み）
+    save_per_stock_pnl_csv(trades, open_positions, closes, END_DATE, OUTPUT_DIR, meta_path=_meta)
     print(f"\n結果の出力先: {OUTPUT_DIR}\n")
 
